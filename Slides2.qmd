@@ -1,0 +1,734 @@
+---
+title: "SIR Modeling Example"
+description: "Illustration of Bayesian Workflow using SIR Model"
+author: Jacqueline Buros
+institute: Generable
+format: 
+  revealjs:
+    theme: simple
+    smaller: true
+    scrollable: true
+    code-annotations: select
+    self-contained: true
+execute:
+  echo: false
+  warning: false
+  error: false
+  tidy: true
+params:
+  seed: 1248705
+---
+
+```{r}
+library(tidyverse)
+library(tidybayes)
+library(cmdstanr)
+library(plotly)
+library(rstan)
+library(geomtextpath)
+ggplot2::theme_set(ggdist::theme_ggdist())
+options(mc.cores = 4)
+set.seed(params$seed)
+```
+
+# Introduction
+
+## A little about me {background-color="black" background-image="https://www.sail-world.com/photos/sailworld/photos_2016_09_new/Large_John%20Navas%2020160907%20145704%20P1010609.jpg"}
+
+1. I don't work in infectious disease modeling, instead I analyze:
+    - Clinical trial data from Oncology
+    - Bioinformatics (genomics, multi-omics) in Alzheimer's Disease, Oncology, and others
+    - Previously: book sales, marketing campaigns, market research, cardiology, epidemiology, etc.
+    
+2. I've always been interested in different modeling approaches. There is a _ton_ of value in cross-disciplinary pollination.
+
+3. I work in multiple programming languages: 
+    - Currently Stan, Python and R. 
+    - Previously: Stata, SAS, even some old VB code.
+
+## The SIR Model
+
+This is a 3-compartment ODE model, in which a person at any one time is either:
+
+- Susceptible to disease
+- Infected (assumed infectious)
+- Recovered (and thus not infectious)
+
+![](images/sir-model.png)
+
+Image source: https://mc-stan.org/users/documentation/case-studies/boarding_school_case_study.html
+
+
+## Compartments
+
+Each of these states is termed a "compartment", and we model the size of each compartment at time $t$ as the number of individuals in this state at that time.
+
+It is described by a system of ODEs:
+
+$$
+\begin{aligned}
+ \frac{dS}{dt} &= -\beta  S \frac{I}{N}\\
+ \frac{dI}{dt} &= \beta  S  \frac{I}{N} - \gamma  I \\
+ \frac{dR}{dt} &= \gamma I
+\end{aligned}
+$$
+
+The number of infections in any day or week will depend on the sizes of these compartments, and:
+
+- $\frac{I}{N}$: the proportion of infected people in the population.
+- $\beta$: how infectious the disease is. $\frac{1}{\beta}$ is also the average time between contacts in the population.
+- $\gamma$: rate of recovery of infected persons. $\frac{1}{\gamma}$ is the average recovery time per person.
+
+## Implications
+
+::: {.incremental}
+
+1. The total population size is fixed: $N = S(t) + I(t) + R(t)$ at all times
+2. The $R$ state is terminal: once a subject is in this state, the subject's state cannot change.
+3. The dynamics of $I(t)$ over time depend entirely on $\beta$ and $\gamma$, specifically:
+
+:::
+
+. . .
+
+$$
+R_0 = \frac{\beta}{\gamma}
+$$
+
+This number is called the basic reproduction number, reflecting the expected number of new infections from a single infected person in a population of susceptible people.
+
+. . .
+
+:::: {.columns}
+
+::: {.column width="50%"}
+![](https://upload.wikimedia.org/wikipedia/commons/thumb/7/71/Measles_child_Philippines.jpg/680px-Measles_child_Philippines.jpg)
+src: https://en.wikipedia.org/wiki/Measles
+:::
+
+::: {.column width="50%"}
+:::
+
+::::
+
+# Basic SIR model
+
+## Install packages
+
+Before we get started (if you want to follow along):
+
+1. Install cmdstanr according to [documentation](https://mc-stan.org/cmdstanr/)
+1. Use cmdstanr to install CmdStan: `install_cmdstan()`
+
+## Defining the SIR Model
+
+We are going to start by implementing the ode function body in Stan code:
+
+```{.stan code-line-numbers="8-17"}
+functions {
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      real beta = theta[1];
+      real gamma = theta[2];
+      
+      real S = y[1];
+      real I = y[2];
+      real R = y[3];
+      real P = S + I + R;
+      vector[3] dy_dt;
+
+      dy_dt[1] = -beta * I * S / P;
+      dy_dt[2] =  beta * I * S / P - gamma * I;
+      dy_dt[3] =  gamma * I;
+      return(dy_dt);
+  }
+}
+```
+
+## Population Dynamics
+
+We can now write a minimal Stan program that will allow us to simulate different population dynamics.
+
+We write all our methods as functions, so we can re-use them later.
+
+We will save this in a file: `sir-simulation.stan`
+
+```{.stan}
+functions {
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      real beta = theta[1];
+      real gamma = theta[2];
+
+      real S = y[1];
+      real I = y[2];
+      real R = y[3];
+      real N = S + I + R;
+      real dy_dt[3];
+
+      dy_dt[1] = -beta * I * S / N;
+      dy_dt[2] =  beta * I * S / N - gamma * I;
+      dy_dt[3] =  gamma * I;
+      return(dy_dt);
+  }
+  
+  real[,] simulate_sir(real[] t, data int N, data int i0, real beta, real gamma) {
+    int N_t = num_elements(t);
+    real y0[3] = {N - i0 + 0.0, i0 + 0.0, 0.0};
+    real t0 = 0;
+    real theta[2] = {beta, gamma};
+    real y[N_t, 3];
+    y = integrate_ode_rk45(sir, y0, t0, t, theta, rep_array(0.0, 0), rep_array(0, 0));
+    return(y);
+  }
+}
+model {
+}
+```
+
+## Simulating from the model
+
+We can now use the `rstan` package to expose these as R functions.
+
+This is a powerful tool for model interrogation; the functions are written in Stan code, transpiled to C++, and exposed to R through Rcpp.
+
+```{.r}
+library(rstan)
+expose_stan_functions('model/sir-simulation.stan')
+t <- seq(from = 0, to = 25, by = 0.1)
+sim_df <- simulate_sir(t = t,
+                   N = 1000,
+                   i0 = 1,
+                   beta = 4,
+                   gamma = 1/4
+                  ) %>%
+  map(set_names, c('S', 'I', 'R')) %>% 
+  map_dfr(as_tibble_row, .id = 't_index') %>%
+  mutate(t_index = as.integer(t_index)) %>%
+  left_join(tibble(t = t) %>% mutate(t_index = row_number()))
+```
+
+```{r}
+#| include: false
+#| echo: true
+library(rstan)
+expose_stan_functions('model/sir-simulation.stan')
+```
+
+```{r}
+#| echo: true
+t <- seq(from = 0, to = 25, by = 0.1)
+sim_df <- simulate_sir(t = t,
+                   N = 1000,
+                   i0 = 1,
+                   beta = 4,
+                   gamma = 1/4
+                  ) %>%
+  map(set_names, c('S', 'I', 'R')) %>% 
+  map_dfr(as_tibble_row, .id = 't_index') %>%
+  mutate(t_index = as.integer(t_index)) %>%
+  left_join(tibble(t = t) %>% mutate(t_index = row_number()))
+p <- sim_df %>%
+  tidyr::gather(state, N, S, I, R) %>%
+  ggplot(aes(x = t, y = N, colour = state)) +
+  geom_line(linewidth = 2) +
+  ggtitle('Simulated Population Dynamics') +
+  theme(text = element_text(size = 15))
+```
+
+## Result
+
+```{r}
+ggplotly(p)
+```
+
+## Data likelihood
+
+Of course, the data that are observed are rarely this clean.
+
+Let's assume we have data for daily counts of cases, and that we will model this as a negative binomial observation model.
+
+We add a new function to our data simulation for the observed data:
+
+```{.stan}
+  int[] simulate_cases_rng(real[] t, data int N, data int i0, real beta, real gamma, real phi) {
+    int N_t = num_elements(t);
+    real y[N_t, 3] = simulate_sir(t, N, i0, beta, gamma);
+    int cases[N_t] = neg_binomial_2_rng(y[,2], phi);
+    return(cases);
+  }
+```
+
+## Update our simulation
+
+Now, we can update our simulation to include both the asssumed "true" population incidence and the observed counts:
+
+```{.r}
+expose_stan_functions('model/sir-simulation.stan')
+case_t <- seq(from = 0, to = max(t), by = 1)
+sim_cases <- simulate_cases_rng(t = case_t,
+                   N = 1000,
+                   i0 = 1,
+                   beta = 4,
+                   gamma = 1/4,
+                   phi = 10,
+                  ) %>%
+  tibble(cases = .) %>%
+  bind_cols(t = case_t)
+```
+
+```{r}
+#| include: false
+expose_stan_functions('model/sir-simulation.stan')
+case_t <- seq(from = 0, to = max(t), by = 1)
+sim_cases <- simulate_cases_rng(t = case_t,
+                   N = 1000,
+                   i0 = 1,
+                   beta = 4,
+                   gamma = 1/4,
+                   phi = 10,
+                  ) %>%
+  tibble(cases = .) %>%
+  bind_cols(t = case_t)
+sim_df_cases <- sim_df %>%
+  left_join(sim_cases)
+```
+
+```{r}
+p <- sim_df_cases %>%
+  tidyr::gather(state, N, S, I, R) %>%
+  ggplot(aes(x = t, y = N, colour = state)) +
+  geom_line(linewidth = 2) +
+  geom_point(aes(y = cases, colour = 'cases')) +
+  ggtitle('Simulated Population Dynamics') +
+  theme(text = element_text(size = 15))
+ggplotly(p)
+```
+
+# Testing the model
+
+## Fit to simulated data
+
+We first develop and evaluate our model using simulated data.
+
+```{r}
+#| include: false
+basic_sir <- cmdstanr::cmdstan_model(here::here('model/sir-model.stan'))
+basic_sir$print()
+fit_file <- here::here('fits', 'basic_sir_fit.Rds')
+if (!fs::file_exists(fit_file)) {
+  sim_data <- list(N = 1000, 
+                   i0 = 1, 
+                   N_t = nrow(sim_cases), 
+                   t = sim_cases$t, 
+                   cases = sim_cases$cases)
+  sir_fit <- basic_sir$sample(data = sim_data, seed = params$seed, refresh = 0)
+  sir_fit$save_object(fit_file)
+} else {
+  sir_fit <- readRDS(fit_file)
+}
+```
+
+```{r}
+basic_sir <- cmdstanr::cmdstan_model(here::here('model/sir-model.stan'))
+basic_sir$print()
+```
+
+```{.r}
+sim_data <- list(N = 1000, 
+                 i0 = 1, 
+                 N_t = nrow(sim_cases), 
+                 t = sim_cases$t, 
+                 cases = sim_cases$cases)
+sir_fit <- basic_sir$sample(data = sim_data, seed = params$seed, refresh = 0)
+sir_fit$save_object(here::here('fits', 'basic_sir_fit.Rds'))
+```
+
+## Posterior estimates 
+
+Formatting posterior estimates takes some care
+
+```{r}
+library(tidybayes)
+fit_draws <- sir_fit %>%
+  gather_draws(yrep[i], ys[i, state_index]) %>%
+  ungroup() %>%
+  left_join(sim_cases %>% mutate(i = row_number())) %>%
+  left_join(tibble(state = c('S', 'I', 'R')) %>% 
+              mutate(state_index = row_number())) %>%
+  mutate(state = if_else(is.na(state), .variable, state)) %>%
+  select(state, .value, .chain, .iteration, .draw, cases, t) %>%
+  spread(state, .value)
+```
+
+Once formatted, we can use `tidybayes` to summarize flexibly:
+
+```{r}
+fit_draws %>%
+  gather(state, .value, S, I, R) %>%
+  ggplot(aes(x = t, y = .value, group = state, fill = state, colour = state)) +
+  stat_lineribbon(.width = c(0.8), alpha = 0.4) +
+  ggtitle('Posterior estimates of population dynamics') +
+  labs(caption = 'Showing median and 80% CrI')
+```
+
+## Parameters
+
+::: panel-tabset
+
+### Beta
+
+```{r}
+sir_fit %>%
+  gather_draws(beta) %>%
+  ggplot(aes(x = .value)) +
+  stat_halfeye(alpha = 0.8, .width = c(0.5, .8)) +
+  theme(legend.position = 'none') +
+  geom_vline(xintercept = 4, linetype = 'dashed', colour = 'skyblue', size = 0.7) +
+  ggtitle('Posterior estimate of beta') +
+  scale_x_continuous('Value') + 
+  scale_y_continuous('density') +
+  labs(caption = 'Dashed line shows true value used for simulation')
+```
+
+### Gamma
+
+```{r}
+sir_fit %>%
+  gather_draws(gamma) %>%
+  ggplot(aes(x = .value)) +
+  stat_halfeye(alpha = 0.8, .width = c(0.5, .8)) +
+  theme(legend.position = 'none') +
+  geom_vline(xintercept = 1/4, linetype = 'dashed', colour = 'skyblue', size = 0.7) +
+  ggtitle('Posterior estimate of gamma') +
+  scale_x_continuous('Value') + 
+  scale_y_continuous('density') +
+  labs(caption = 'Dashed line shows true value used for simulation')
+```
+
+### Phi
+
+```{r}
+sir_fit %>%
+  gather_draws(phi) %>%
+  ggplot(aes(x = .value)) +
+  stat_halfeye(alpha = 0.8, .width = c(0.5, .8)) +
+  theme(legend.position = 'none') +
+  geom_vline(xintercept = 10, linetype = 'dashed', colour = 'skyblue', size = 0.7) +
+  ggtitle('Posterior estimate of phi') +
+  scale_x_continuous('Value') + 
+  scale_y_continuous('density') +
+  labs(caption = 'Dashed line shows true value used for simulation')
+```
+
+:::
+
+# Example: Flu outbreak
+
+## Data 
+
+::: panel-tabset
+
+### Background
+
+There is a canonical dataset describing a particularly virulent flu outbreak at a boarding school in 1978. Later, it was determined that the flu was H1N1, however this was not known during the event.
+
+### Observed data
+
+We are given the following in the data description: 
+
+> The index case was infected by 1978-01-10, and had febrile illness from 1978-01-15 to 1978-01-18. 512 boys out of 763 became ill.
+
+```{r}
+library(outbreaks)
+influenza_england_1978_school %>%
+  gather(.variable, .value, in_bed, convalescent) %>%
+  ggplot(aes(x = date, y = .value, colour = .variable)) + 
+  geom_point() + 
+  geom_line() + 
+  labs(y = "Number of students")
+```
+
+It's worth noting that the minimal date in our data is: `r min(influenza_england_1978_school$date)`.
+
+These data are missing details of the index case. We will hard-code this information as our initial conditions.
+
+We will also ignore the "convalescent" category, for now, and lump them in with the "recovered" group (neither infectious nor susceptible).
+
+:::
+
+## Fitting the model
+
+```{.r}
+# prepare data
+flu_N_t<- 763
+date0 <- min(influenza_england_1978_school$date)
+flu_t <- as.integer(influenza_england_1978_school$date - date0)
+flu_cases <- influenza_england_1978_school$in_bed
+
+flu_data <- list(N = flu_N_t, 
+                 i0 = 1, 
+                 N_t = length(flu_t), 
+                 t = flu_t, 
+                 cases = flu_cases)
+                 
+# sample model
+flu_fit <- basic_sir$sample(data = flu_data, 
+                            seed = params$seed, refresh = 0)
+```
+
+```{r}
+#| include: false
+flu_N_t<- 763
+date0 <- min(influenza_england_1978_school$date)
+flu_t <- as.integer(influenza_england_1978_school$date - date0)
+flu_cases <- influenza_england_1978_school$in_bed
+
+fit_file <- here::here('fits', 'boarding_school-basic_sir_fit.Rds')
+if (!fs::file_exists(fit_file)) {
+  flu_data <- list(N = flu_N_t, 
+                   i0 = 1, 
+                   N_t = length(flu_t), 
+                   t = flu_t, 
+                   cases = flu_cases)
+  flu_fit <- basic_sir$sample(data = flu_data, seed = params$seed, refresh = 0)
+  flu_fit$save_object(fit_file)
+} else {
+  flu_fit <- readRDS(fit_file)
+}
+```
+
+## Posterior estimates 
+
+Formatting posterior estimates takes some care
+
+```{r}
+#| echo: true
+library(tidybayes)
+fit_draws <- flu_fit %>%
+  gather_draws(yrep[i], ys[i, state_index]) %>%
+  ungroup() %>%
+  left_join(tibble(t = flu_t, cases = flu_cases) %>% mutate(i = row_number())) %>%
+  left_join(tibble(state = c('S', 'I', 'R')) %>% 
+              mutate(state_index = row_number())) %>%
+  mutate(state = if_else(is.na(state), .variable, state)) %>%
+  select(state, .value, .chain, .iteration, .draw, cases, t) %>%
+  spread(state, .value)
+```
+
+Now, we can compare the posterior estimates to our observed data:
+
+```{r}
+fit_draws %>%
+  gather(state, .value, S, I, R) %>%
+  ggplot(aes(x = t, y = .value, group = state, fill = state, colour = state)) +
+  stat_lineribbon(.width = c(0.8), alpha = 0.4) +
+  geom_point(aes(y = cases, 
+                 colour = NULL, 
+                 fill = NULL)) +
+  scale_y_continuous('N') +
+  scale_x_continuous('time') +
+  ggtitle('Posterior estimates of population dynamics for flu outbreak') +
+  labs(caption = str_c('Ribbons show posterior median and 80% CrI', 
+                       'Points reflect observed values',
+                       sep = "\n")
+       )
+```
+
+## Predictive checks
+
+```{r}
+fit_draws %>%
+  ggplot(aes(x = yrep, colour = 'predicted', fill = 'predicted')) +
+  stat_halfeye(alpha = 0.3) +
+  stat_histinterval(aes(x = cases, colour = 'observed', fill = 'observed'), data = tibble(cases = flu_cases),
+                    alpha = 0.2) +
+  ggtitle('Observed vs Predicted Case Counts for Flu Outbreak') +
+  scale_fill_discrete('Type') +
+  scale_colour_discrete('Type') +
+  scale_y_continuous('Density') +
+  scale_x_continuous('Value')
+```
+
+  
+## Parameters
+
+::: panel-tabset
+
+### Beta
+
+```{r}
+flu_fit %>%
+  gather_draws(beta) %>%
+  ggplot(aes(x = .value)) +
+  stat_halfeye(alpha = 0.8, .width = c(0.5, .8)) +
+  theme(legend.position = 'none') +
+  ggtitle('Posterior estimate of beta') +
+  scale_x_continuous('Value') + 
+  scale_y_continuous('density') +
+  labs(caption = 'Showing posterior median and 50%/80% CrI')
+```
+
+### Gamma
+
+```{r}
+sir_fit %>%
+  gather_draws(gamma) %>%
+  ggplot(aes(x = .value)) +
+  stat_halfeye(alpha = 0.8, .width = c(0.5, .8)) +
+  theme(legend.position = 'none') +
+  ggtitle('Posterior estimate of gamma') +
+  scale_x_continuous('Value') + 
+  scale_y_continuous('density') +
+  labs(caption = 'Showing posterior median and 50%/80% CrI')
+```
+
+### Phi
+
+```{r}
+sir_fit %>%
+  gather_draws(phi) %>%
+  ggplot(aes(x = .value)) +
+  stat_halfeye(alpha = 0.8, .width = c(0.5, .8)) +
+  theme(legend.position = 'none') +
+  ggtitle('Posterior estimate of phi') +
+  scale_x_continuous('Value') + 
+  scale_y_continuous('density') +
+  labs(caption = 'Showing posterior median and 50%/80% CrI')
+```
+
+### R0
+
+```{r}
+sir_fit %>%
+  spread_draws(gamma, beta) %>%
+  mutate(r0 = beta / gamma) %>%
+  ggplot(aes(x = r0)) +
+  stat_halfeye(alpha = 0.8, .width = c(0.5, .8)) +
+  theme(legend.position = 'none') +
+  ggtitle('Posterior estimate of R0') +
+  scale_x_continuous('Value') + 
+  scale_y_continuous('density') +
+  labs(caption = 'Showing posterior median and 50%/80% CrI')
+```
+
+### Recovery Time
+
+```{r}
+sir_fit %>%
+  spread_draws(gamma, beta) %>%
+  mutate(time = 1/gamma) %>%
+  ggplot(aes(x = time)) +
+  stat_halfeye(alpha = 0.8, .width = c(0.5, .8)) +
+  theme(legend.position = 'none') +
+  ggtitle('Posterior estimate of recovery time (1/gamma)') +
+  scale_x_continuous('Value') + 
+  scale_y_continuous('density') +
+  labs(caption = 'Showing posterior median and 50%/80% CrI')
+```
+
+:::
+
+# Extensions
+
+The assumptions of the basic SIR model do not apply to most pandemics.
+
+It is a starting point.
+
+## COVID-19 data
+
+```{r}
+df_swiss <- read_csv("data/swiss_agg_data.csv")
+df_swiss %>% 
+  ggplot() + 
+  geom_bar(mapping = aes(x = date, y = report_dt), stat = "identity") +
+  labs(y="Number of reported cases") +
+  ggtitle('Number of cases')
+```
+
+```{r}
+#| include: false
+covid_N_t<- 1e+04
+date0 <- min(df_swiss$date)
+covid_t <- as.integer(df_swiss$date - date0)
+covid_cases <- df_swiss$report_dt
+
+fit_file <- here::here('fits', 'covid-basic_sir_fit2.Rds')
+if (!fs::file_exists(fit_file)) {
+  covid_data <- list(N = covid_N_t, 
+                   i0 = 1, 
+                   N_t = length(covid_t), 
+                   t = covid_t, 
+                   cases = covid_cases)
+  covid_fit <- basic_sir$sample(data = covid_data, seed = params$seed, refresh = 0)
+  covid_fit$save_object(fit_file)
+} else {
+  covid_fit <- readRDS(fit_file)
+}
+```
+
+
+Formatting posterior estimates takes some care
+
+```{r}
+#| echo: true
+library(tidybayes)
+fit_draws <- covid_fit %>%
+  gather_draws(yrep[i], ys[i, state_index]) %>%
+  ungroup() %>%
+  left_join(tibble(t = covid_t, cases = covid_cases) %>% mutate(i = row_number())) %>%
+  left_join(tibble(state = c('S', 'I', 'R')) %>% 
+              mutate(state_index = row_number())) %>%
+  mutate(state = if_else(is.na(state), .variable, state)) %>%
+  select(state, .value, .chain, .iteration, .draw, cases, t) %>%
+  spread(state, .value)
+```
+
+```{r}
+fit_draws %>%
+  gather(state, .value, S, I, R) %>%
+  ggplot(aes(x = t, y = .value, group = state, fill = state, colour = state)) +
+  stat_lineribbon(.width = c(0.8), alpha = 0.4) +
+  geom_point(aes(y = cases, 
+                 colour = NULL, 
+                 fill = NULL)) +
+  scale_y_continuous('N') +
+  scale_x_continuous('time') +
+  ggtitle('Posterior estimates of population dynamics for covid-19 outbreak') +
+  labs(caption = str_c('Ribbons show posterior median and 80% CrI', 
+                       'Points reflect observed values',
+                       sep = "\n")
+       )
+```
+
+## Model formulation
+
+As an example, consider this 8-compartment model used to describe COVID-19 disease dynamics. 
+
+![](images/extended-sir-model.webp)
+
+The observed data include daily counts of **C**ase, **H**ospitalization, and **D**eath counts. Each is modeled using a negative binomial given the estimated true prevalence.
+
+src: Keller, JP, Zhou, T, Kaplan, A, Anderson, GB, Zhou, W. Tracking the transmission dynamics of COVID-19 with a time-varying coefficient state-space model. Statistics in Medicine. 2022; 41( 15): 2745- 2767. doi:10.1002/sim.9382
+
+## Covariates
+
+In addition, their model includes particular covariate effects on time-varying infectiousness parameters.
+
+For example, one informative covariate was the degree of mobility (from aggregate cell-phone tracking data)
+
+![](images/mobility-effect.png)
+
+Keller, JP, Zhou, T, Kaplan, A, Anderson, GB, Zhou, W. Tracking the transmission dynamics of COVID-19 with a time-varying coefficient state-space model. Statistics in Medicine. 2022; 41( 15): 2745- 2767. doi:10.1002/sim.9382
+
+# Acknowledgements
+
+
+## Sources
+
+- https://mc-stan.org/users/documentation/case-studies/boarding_school_case_study.html#stan_codes
+- Keller, JP, Zhou, T, Kaplan, A, Anderson, GB, Zhou, W. Tracking the transmission dynamics of COVID-19 with a time-varying coefficient state-space model. Statistics in Medicine. 2022; 41( 15): 2745- 2767. doi:10.1002/sim.9382
+
+Full code available at: 
